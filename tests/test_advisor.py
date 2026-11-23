@@ -5,7 +5,7 @@ from strands import Agent
 
 from strands_tool_graph import ToolGraph, ToolGraphAdvisor, _values
 from strands_tool_graph._prompts import CandidateScore, GoalSelection, GraphAdvice, ToolDependencies, ToolDependency
-from tests.support import ScriptedModel, call_message, shop_graph, shop_tools, text_message
+from tests.support import ScriptedModel, call_message, make_tool, shop_graph, shop_tools, text_message
 
 ASK = "Please refund my order. My email is ana@shop.test. The reason is damage."
 ADVICE_TAG = "<tool_graph_advice>"
@@ -22,6 +22,27 @@ def answers(goals=("refund_order",), score=8):
         "CandidateScore": lambda prompt: CandidateScore(score=score, reason="It finds the user id."),
         "GraphAdvice": lambda prompt: GraphAdvice(feedback="Find the user first.", recommended_action="find_user"),
     }
+
+
+SHOP_DEPENDENCIES = {
+    "find_user": ("find_user", "list_orders", "user_id"),
+    "list_orders": ("list_orders", "refund_order", "order_id"),
+}
+
+
+def shop_dependencies(prompt):
+    focus = prompt.split("Focus tool:\n- ", 1)[1].split(":", 1)[0]
+    if focus not in SHOP_DEPENDENCIES:
+        return ToolDependencies(dependencies=[])
+    source, target, field = SHOP_DEPENDENCIES[focus]
+    found = ToolDependency(source=source, target=target, input=field, output=field, confidence=0.9, probe_query="q")
+    return ToolDependencies(dependencies=[found])
+
+
+def focuses(model):
+    return [
+        call["prompt"].split("Focus tool:\n- ", 1)[1].split(":", 1)[0] for call in model.calls_for("ToolDependencies")
+    ]
 
 
 def advised(call):
@@ -44,6 +65,7 @@ async def test_advice_reaches_each_model_call_but_not_the_history():
     assert "Recommended next action: find_user" in first_advice
     assert ADVICE_TAG not in str(agent.messages)
     assert advisor.usage["totalTokens"] > 0
+    assert model.calls_for("ToolDependencies") == []
 
 
 async def test_goals_are_inferred_once_per_request():
@@ -198,3 +220,61 @@ async def test_a_built_and_saved_graph_drives_the_advice(tmp_path):
     [first_advice] = advised(next(call for call in model.stream_calls if advised(call)))
     assert "find_user -> list_orders (weight 0.90): fills user_id" in str(model.calls_for("GraphAdvice")[0]["prompt"])
     assert 'find_user(email="ana@shop.test") for goal list_orders' in first_advice
+
+
+async def test_builds_the_graph_from_the_agent_tools_on_the_first_model_call():
+    model = ScriptedModel(plan=finds_user_then_finishes, answers={**answers(), "ToolDependencies": shop_dependencies})
+    advisor = ToolGraphAdvisor()
+    agent = Agent(model=model, tools=shop_tools(), plugins=[advisor], callback_handler=None)
+
+    await agent.invoke_async(ASK)
+
+    assert sorted(focuses(model)) == sorted(tool.tool_name for tool in shop_tools())
+    assert [(edge.source, edge.target) for edge in advisor.graph.edges] == [
+        ("find_user", "list_orders"),
+        ("list_orders", "refund_order"),
+    ]
+    assert len([call for call in model.stream_calls if advised(call)]) == 2
+
+
+async def test_updates_the_graph_only_for_tools_added_later():
+    model = ScriptedModel(plan=finds_user_then_finishes, answers={**answers(), "ToolDependencies": shop_dependencies})
+    advisor = ToolGraphAdvisor()
+    agent = Agent(model=model, tools=shop_tools(), plugins=[advisor], callback_handler=None)
+    await agent.invoke_async(ASK)
+    built = len(focuses(model))
+
+    agent.tool_registry.register_tool(make_tool("cancel_order", "Cancel an order.", {"order_id": "string"}))
+    await agent.invoke_async(ASK)
+
+    assert focuses(model)[built:] == ["cancel_order"]
+    assert "cancel_order" in advisor.graph.nodes
+
+
+async def test_the_graph_file_keeps_the_graph_between_advisors(tmp_path):
+    path = tmp_path / "graphs" / "tool_graph.json"
+    first = ScriptedModel(plan=finds_user_then_finishes, answers={**answers(), "ToolDependencies": shop_dependencies})
+    agent = Agent(model=first, tools=shop_tools(), plugins=[ToolGraphAdvisor(graph_file=path)], callback_handler=None)
+    await agent.invoke_async(ASK)
+    second = ScriptedModel(plan=finds_user_then_finishes, answers=answers())
+    advisor = ToolGraphAdvisor(graph_file=path)
+    agent = Agent(model=second, tools=shop_tools(), plugins=[advisor], callback_handler=None)
+
+    await agent.invoke_async(ASK)
+
+    assert second.calls_for("ToolDependencies") == []
+    assert advisor.graph == ToolGraph.load(path)
+    assert len([call for call in second.stream_calls if advised(call)]) == 2
+
+
+async def test_an_unreadable_graph_file_is_built_again(tmp_path, caplog):
+    path = tmp_path / "tool_graph.json"
+    path.write_text("not json")
+    model = ScriptedModel(plan=finds_user_then_finishes, answers={**answers(), "ToolDependencies": shop_dependencies})
+    agent = Agent(model=model, tools=shop_tools(), plugins=[ToolGraphAdvisor(graph_file=path)], callback_handler=None)
+
+    with caplog.at_level(logging.WARNING, logger="strands_tool_graph.advisor"):
+        await agent.invoke_async(ASK)
+
+    assert "cannot read the tool graph file" in caplog.text
+    assert len(ToolGraph.load(path).edges) == 2

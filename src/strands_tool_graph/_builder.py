@@ -12,6 +12,7 @@ from typing import Any, TypeVar
 
 from strands import Agent
 from strands.models import Model
+from strands.tools.tools import normalize_tool_spec
 from strands.types.tools import AgentTool, ToolSpec
 
 from ._llm import UsageMeter, ask
@@ -87,6 +88,7 @@ async def build_graph(
 
 
 def node_from_spec(spec: ToolSpec) -> ToolNode:
+    spec = normalize_tool_spec(spec)
     input_schema = _unwrap(spec.get("inputSchema"))
     output_schema = _unwrap(spec.get("outputSchema"))
     canonical = json.dumps(
@@ -99,6 +101,19 @@ def node_from_spec(spec: ToolSpec) -> ToolNode:
         outputs=_fields(output_schema),
         fingerprint=hashlib.sha256(canonical.encode()).hexdigest()[:16],
     )
+
+
+def catalog_key(tools: Iterable[AgentTool]) -> str:
+    return _key((tool.tool_name, node_from_spec(tool.tool_spec).fingerprint) for tool in tools)
+
+
+def graph_key(graph: ToolGraph) -> str:
+    return _key((name, node.fingerprint) for name, node in graph.nodes.items())
+
+
+def _key(fingerprints: Iterable[tuple[str, str]]) -> str:
+    lines = sorted(f"{name}:{fingerprint}" for name, fingerprint in fingerprints)
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:16]
 
 
 def _default_model() -> Model:

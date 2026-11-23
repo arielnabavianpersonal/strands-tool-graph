@@ -15,21 +15,33 @@ pip install "git+https://github.com/arielnabavianpersonal/strands-tool-graph.git
 ## Quick start
 
 ```python
-import asyncio
-
 from strands import Agent
-from strands_tool_graph import ToolGraph, ToolGraphAdvisor
+from strands_tool_graph import ToolGraphAdvisor
 
-tools = [find_user, list_orders, refund_order]
-
-graph = asyncio.run(ToolGraph.build(tools))
-graph.save("tool_graph.json")
-
-agent = Agent(tools=tools, plugins=[ToolGraphAdvisor(ToolGraph.load("tool_graph.json"))])
+agent = Agent(tools=[find_user, list_orders, refund_order], plugins=[ToolGraphAdvisor()])
 agent("Refund my last order. My email is ana@example.com.")
 ```
 
-`ToolGraph.build` uses a default Bedrock model. To use a different model, give `model=`.
+On the first model call, the advisor builds the graph from the tools of the agent, with `agent.aux_model`. When the agent gets new or changed tools, the advisor updates the graph for those tools only.
+
+To keep the graph between runs, give a file. The advisor reads the file when it starts, and writes the file after each update.
+
+```python
+advisor = ToolGraphAdvisor(graph_file="tool_graph.json")
+```
+
+## Build the graph ahead of time
+
+You can also build the graph before the agent runs, for example in CI or to examine the edges first. `ToolGraph.build` uses a default Bedrock model. To use a different model, give `model=`.
+
+```python
+graph = await ToolGraph.build(tools)
+graph.save("tool_graph.json")
+
+agent = Agent(tools=tools, plugins=[ToolGraphAdvisor(graph)])
+```
+
+`advisor.graph` gives the graph that the advisor uses at this time.
 
 ## How the builder makes the graph
 
@@ -43,7 +55,7 @@ The weight of an edge is the mean confidence of its evidence. The builder remove
 
 > **CAUTION:** Probes run your real tools. Use `probe=True` only with tools that cannot change real data, for example sandbox tools or mocks.
 
-When the catalog changes, give the old graph as `base`. The builder then examines only new and changed tools, and removes the tools that are gone.
+The advisor updates its graph by itself. For a graph that you build ahead of time, give the old graph as `base` when the catalog changes. The builder then examines only new and changed tools, and removes the tools that are gone.
 
 ```python
 graph = await ToolGraph.build(tools, base=ToolGraph.load("tool_graph.json"))
@@ -73,13 +85,16 @@ In the paper, only the `"llm"` scorer did better than PageRank on the same graph
 
 | Setting | Default | Effect |
 |---|---|---|
+| `graph` | `None` | Sets a graph to start from. The advisor still updates it for new tools. |
+| `graph_file` | `None` | Sets a file that keeps the graph between runs. |
+| `probe` | `False` | Lets the builder run probes with the real tools of the agent. |
 | `scorer` | `"llm"` | Selects how the advisor ranks candidates. |
 | `candidates` | 4 | Sets the number of sampled next actions for each model call. |
 | `top_k` | 8 | Sets the number of action and goal rows in the advice. |
 | `hops` | 1 | Sets the radius of the graph evidence around the candidate and goal tools. |
 | `min_edge_weight` | 0.0 | Removes edges below this weight from the evidence. |
 | `scorer_samples` | 1 | Sets the number of scorer calls for each candidate. The paper used 5 at temperature 1.0. |
-| `model` | `None` | Sets the model for goals, scores and advice. `None` selects `agent.aux_model`. |
+| `model` | `None` | Sets the model for the graph, goals, scores and advice. `None` selects `agent.aux_model`. |
 
 ## Cost
 
@@ -89,6 +104,8 @@ Each model call of the agent adds these model calls:
 - `scorer_samples` calls for each admissible candidate, with the `"llm"` scorer only.
 - One call for the advice.
 - One call for the goals, for each new user request.
+
+The first model call also builds the graph. The build makes one model call for each tool, and more calls for the probes when `probe=True`. After a change to the tools, the update makes calls for the new and changed tools only.
 
 `advisor.usage` gives the tokens of these calls. The usage of the agent does not include them.
 

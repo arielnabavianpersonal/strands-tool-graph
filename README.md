@@ -1,74 +1,116 @@
-<div align="center">
-  <div>
-    <a href="https://strandsagents.com">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="https://strandsagents.com/latest/assets/wordmark-github-dark.svg">
-        <img src="https://strandsagents.com/latest/assets/wordmark-github-light.svg" alt="Strands" width="320">
-      </picture>
-    </a>
-  </div>
-  <h1>Strands Agents Extension Template</h1>
-  <h2>Build and publish custom components for Strands Agents.</h2>
-  <p>
-    <a href="https://strandsagents.com/">Documentation</a> ◆
-    <a href="https://github.com/strands-agents/samples">Samples</a> ◆
-    <a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-cli">CLI</a> ◆
-    <a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-mcp">MCP Server</a>
-    <br>
-    Harness (<a href="https://github.com/strands-agents/harness-sdk/tree/main/harness-py">Python</a>, <a href="https://github.com/strands-agents/harness-sdk/tree/main/harness-ts">TypeScript</a>) ◆
-    SDK (<a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-py">Python</a>, <a href="https://github.com/strands-agents/harness-sdk/tree/main/strands-ts">TypeScript</a>) ◆
-    <a href="https://github.com/strands-agents/box">Box</a> ◆
-    <a href="https://github.com/strands-agents/shell">Shell</a> ◆
-    <a href="https://github.com/strands-agents/evals">Evals</a> ◆
-    <a href="https://github.com/strands-labs">Labs</a>
-  </p>
-</div>
+# strands-tool-graph
 
-This monorepo contains starter templates for building custom Strands Agents extensions in two languages. Each template gives you skeletons for the major extension points, an interactive setup script that customizes the project for your package, and CI/publish workflows wired up to PyPI or npm.
+ToolGraph for [Strands Agents](https://strandsagents.com). The package builds a dependency graph of your tools one time. Before each model call, it scores candidate next actions with the graph. Then it adds the scores to the prompt as advice. The agent still selects the next action.
 
-| Language   | Directory                  | Package registry | SDK                                                      |
-|------------|----------------------------|------------------|----------------------------------------------------------|
-| Python     | [`python/`](./python)      | PyPI             | [`strands-agents`](https://pypi.org/project/strands-agents/) |
-| TypeScript | [`typescript/`](./typescript) | npm           | [`@strands-agents/sdk`](https://www.npmjs.com/package/@strands-agents/sdk) |
+The method comes from "ToolGraph as a Q-Function for Test-Time Scaling of Tool-Use Agents" (Shen and others, NeurIPS 2026 PTA workshop, [arXiv:2611.20569](https://arxiv.org/abs/2611.20569)). The authors did not release code. This package is an independent implementation from the paper.
 
-## Getting started
+## Install
 
-1. Click **Use this template** on GitHub to create your own repository.
-2. Clone it locally and decide which language you're targeting.
-3. Open the corresponding subdirectory and follow its README:
-   - Python → [`python/README.md`](./python/README.md)
-   - TypeScript → [`typescript/README.md`](./typescript/README.md)
+The package is not on PyPI yet. Install it from GitHub:
 
-You can keep both subprojects in the same repo if your package ships SDKs in both languages, or delete the directory you don't need.
+```bash
+pip install "git+https://github.com/arielnabavianpersonal/strands-tool-graph.git"
+```
 
-## What's in each template
+## Quick start
 
-Both templates expose the same eight Strands extension points so you can pick whichever fits your use case:
+```python
+import asyncio
 
-| Component            | Purpose                                                |
-|----------------------|--------------------------------------------------------|
-| Tool                 | Add capabilities to agents using the `tool` primitive  |
-| Model provider       | Integrate custom LLM APIs                              |
-| Plugin               | Bundle hooks and tools into a composable package       |
-| Intervention         | Add composable control handlers for authorization, guardrails, and steering |
-| Conversation manager | Control context window and message history            |
-| Memory store         | Give agents cross-session knowledge via a search backend |
-| Storage              | Persist sessions, offloaded context, and other data under string keys |
-| Decision model       | Answer closed questions over agent state through a decision API |
+from strands import Agent
+from strands_tool_graph import ToolGraph, ToolGraphAdvisor
 
-The interactive setup script in each subdirectory removes the components you don't select, renames everything to your package name, and wires up `pyproject.toml` / `package.json` accordingly.
+tools = [find_user, list_orders, refund_order]
 
-## Releases and tags
+graph = asyncio.run(ToolGraph.build(tools))
+graph.save("tool_graph.json")
 
-Releases are scoped per language so the two halves of this monorepo can ship independently:
+agent = Agent(tools=tools, plugins=[ToolGraphAdvisor(ToolGraph.load("tool_graph.json"))])
+agent("Refund my last order. My email is ana@example.com.")
+```
 
-| Tag prefix    | Workflow                                        | Publishes to |
-|---------------|-------------------------------------------------|--------------|
-| `python-v*`   | [`publish-python.yml`](.github/workflows/publish-python.yml)         | PyPI         |
-| `typescript-v*` | [`publish-typescript.yml`](.github/workflows/publish-typescript.yml) | npm          |
+`ToolGraph.build` uses a default Bedrock model. To use a different model, give `model=`.
 
-When the setup script hoists your chosen language to the repo root, it drops the dual-prefix scheme automatically — generated repos use the standard `v*` tag form.
+## How the builder makes the graph
+
+The graph has one node for each tool. An edge from tool A to tool B means that the output of A can fill a necessary input of B. Edges come from three sources of evidence:
+
+1. **Schema match.** A declared output field of A has the same name and type as a necessary input of B. This source makes no model calls.
+2. **Model proposals.** One model call for each tool reads the catalog. The model gives the dependencies of that tool in the two directions.
+3. **Probes** (`probe=True`, off by default). For each proposed edge, the builder runs a short agent with A and B, then with B only. A judge compares the two attempts. The result changes the edge confidence, with the proposal as the prior.
+
+The weight of an edge is the mean confidence of its evidence. The builder removes edges with a weight of `min_edge_weight` (default 0.3) or less. Each edge keeps its evidence in `edge.evidence`, so you can see why the edge exists.
+
+> **CAUTION:** Probes run your real tools. Use `probe=True` only with tools that cannot change real data, for example sandbox tools or mocks.
+
+When the catalog changes, give the old graph as `base`. The builder then examines only new and changed tools, and removes the tools that are gone.
+
+```python
+graph = await ToolGraph.build(tools, base=ToolGraph.load("tool_graph.json"))
+```
+
+## How the advice works
+
+`ToolGraphAdvisor` runs before each model call of the agent. For each call, it does these steps:
+
+1. It finds up to three goal tools for the user request. It finds them one time for each request.
+2. It samples `candidates` next actions from the agent's own model, with the same messages and tools.
+3. It calculates a graph value for each candidate and goal (`Q_dp` in the paper). The value comes from value iteration over sets of available inputs.
+4. It marks a candidate as not admissible when a necessary input is missing. It does the same when a tool must supply an input and the value does not occur in the conversation.
+5. It scores each admissible candidate with the selected scorer.
+6. It writes the top rows and the graph evidence as short advice, with one more model call.
+7. It adds the advice to the last user message, for this call only. The advice does not go into `agent.messages`.
+
+| `scorer` | Score | Extra model calls |
+|---|---|---|
+| `"llm"` (default) | A model reads the conversation, the graph evidence and the graph value. Then it gives a score from 0 to 10 (`Q_llm`). | `scorer_samples` for each admissible candidate |
+| `"dp"` | The graph value (`Q_dp`). | None |
+| `"pagerank"` | Personalized PageRank from the request over the graph. | None |
+
+In the paper, only the `"llm"` scorer did better than PageRank on the same graph. Its mean success was 71.0, and the mean success of PageRank was 62.7.
+
+## Settings
+
+| Setting | Default | Effect |
+|---|---|---|
+| `scorer` | `"llm"` | Selects how the advisor ranks candidates. |
+| `candidates` | 4 | Sets the number of sampled next actions for each model call. |
+| `top_k` | 8 | Sets the number of action and goal rows in the advice. |
+| `hops` | 1 | Sets the radius of the graph evidence around the candidate and goal tools. |
+| `min_edge_weight` | 0.0 | Removes edges below this weight from the evidence. |
+| `scorer_samples` | 1 | Sets the number of scorer calls for each candidate. The paper used 5 at temperature 1.0. |
+| `model` | `None` | Sets the model for goals, scores and advice. `None` selects `agent.aux_model`. |
+
+## Cost
+
+Each model call of the agent adds these model calls:
+
+- `candidates` calls to the agent's model, with the full conversation.
+- `scorer_samples` calls for each admissible candidate, with the `"llm"` scorer only.
+- One call for the advice.
+- One call for the goals, for each new user request.
+
+`advisor.usage` gives the tokens of these calls. The usage of the agent does not include them.
+
+## Limits
+
+- The advisor gives no advice to a model that keeps the conversation on the server.
+- The graph value knows tool types, not argument values. Thus it cannot see a correct tool with a wrong argument. The `"llm"` scorer reads the arguments.
+- The candidate samples and the scorer samples use the temperature of their model. To get different samples, set a higher temperature on that model.
+- PageRank starts from the word overlap between the request and the tool descriptions. The paper used embeddings.
+- The package does not include the GraphSAGE scorer (`Q_emb`) from the paper.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+hatch run prepare
+```
+
+## Release
+
+The `publish.yml` workflow publishes the package to PyPI when you publish a GitHub release with a `v` tag, for example `v0.1.0`. Before the first release, configure PyPI trusted publishing with the environment name `pypi`.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE) for details.
+Apache 2.0. See [LICENSE](LICENSE).

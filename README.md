@@ -6,7 +6,7 @@ The method comes from "ToolGraph as a Q-Function for Test-Time Scaling of Tool-U
 
 ## Install
 
-You must have access to this repository.
+The package is not on PyPI yet. Install it from GitHub:
 
 ```bash
 pip install "git+https://github.com/arielnabavianpersonal/strands-tool-graph.git"

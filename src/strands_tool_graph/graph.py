@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -107,7 +109,11 @@ class ToolGraph:
         )
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True))
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=target.parent, suffix=".tmp", delete=False) as handle:
+            handle.write(json.dumps(self.to_dict(), indent=2, sort_keys=True))
+        os.replace(handle.name, target)
 
     @classmethod
     def load(cls, path: str | Path) -> ToolGraph:
